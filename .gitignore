@@ -17,3 +17,5 @@ ledger/backups/
 # 本地私密配置（如后续把 MySQL 口令挪出源码）
 .env
 .ledger.conf
+# AI 工具的本地记忆/会话数据：只留在本机，不入库
+.workbuddy/
