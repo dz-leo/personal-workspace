@@ -1,9 +1,14 @@
 # macOS
 .DS_Store
 
+# Python
+__pycache__/
+*.pyc
+
 # Node（smoke-test.js 的 jsdom 依赖）
 node_modules/
 npm-debug.log*
+package-lock.json 保持入库（锁定 jsdom 版本），如不想入库可删掉此行
 
 # 数据库备份：含真实账目数据，不入库
 ledger/backups/

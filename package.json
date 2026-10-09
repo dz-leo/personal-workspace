@@ -1,0 +1,12 @@
+{
+  "name": "personal-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "个人自用工作台：账本（单文件前端 + 本地 MySQL 后端）",
+  "scripts": {
+    "test": "node ledger/smoke-test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  }
+}

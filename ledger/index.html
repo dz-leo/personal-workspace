@@ -434,6 +434,7 @@ input.inp:focus,select.inp:focus{border-color:var(--brand)}
 <div class="mask" id="maskConfirm" data-page-node-id="p2Lw7loNH8v8ZEL2yn713u"><div class="cf" id="confirmBox" data-page-node-id="M62EygbjWXejvPP0OxMu2B"></div></div>
 <div class="mask" id="maskCat"><div class="sheet" id="sheetCat"></div></div>
 <div class="mask" id="maskAcc"><div class="sheet" id="sheetAcc"></div></div>
+<div class="mask" id="maskToken"><div class="cf" id="tokenBox" style="margin-top:18vh"></div></div>
 <div class="toast" id="toast" data-page-node-id="2mDPczDkgo8oyQtKRduPv8"></div>
 
 <script>
@@ -444,7 +445,7 @@ input.inp:focus,select.inp:focus{border-color:var(--brand)}
 var CONFIG = {
   /* mode:'auto' —— 通过 http(s) 打开时优先连本地 MySQL 后端（server.py），
      直接双击 file:// 打开或后端没起来时自动降级到浏览器本地存储，两种用法都不会卡死 */
-  storage: { mode:'auto', localKey:'wb_ledger_v1', api:'/api/db' },
+  storage: { mode:'auto', localKey:'wb_ledger_v1', api:'/api/db', tokenKey:'wb_ledger_token' },
   bigAmount: 500,
   streakMin: 3
 };
@@ -708,11 +709,27 @@ var CloudAdapter = {
 };
 /* 远端适配器：http(s) 下连本地 MySQL 后端（server.py）。
    读取：优先远端快照，失败则用本地镜像（永不卡死）。
-   写入：先落本地镜像，再防抖同步远端；远端挂了也不丢数据。 */
+   写入：先落本地镜像，再防抖同步远端；远端挂了也不丢数据。
+   令牌：服务端不把它下发到页面（那样局域网谁打开页面都能拿到），
+   由用户输入一次存在本地，或用带 ?t= 的链接首次进入。 */
+var API_TOKEN = '';
+function pickToken(){
+  try{
+    var m=/[?&]t=([^&]+)/.exec(location.search);
+    if(m){
+      localStorage.setItem(CONFIG.storage.tokenKey, decodeURIComponent(m[1]));
+      if(location.replace){ location.replace(location.pathname); }   // 把令牌从地址栏抹掉
+      return decodeURIComponent(m[1]);
+    }
+    return localStorage.getItem(CONFIG.storage.tokenKey)||'';
+  }catch(e){ return ''; }
+}
 function syncGet(url){
   var xhr=new XMLHttpRequest();
   xhr.open('GET', url, false);
+  xhr.setRequestHeader('X-Ledger-Token', API_TOKEN);
   xhr.send();
+  if(xhr.status===401){ throw {unauthorized:true}; }
   if(xhr.status>=200 && xhr.status<300) return JSON.parse(xhr.responseText);
   throw new Error('HTTP '+xhr.status);
 }
@@ -720,38 +737,64 @@ function syncPost(url, data){
   var xhr=new XMLHttpRequest();
   xhr.open('POST', url, false);
   xhr.setRequestHeader('Content-Type','application/json');
+  xhr.setRequestHeader('X-Ledger-Token', API_TOKEN);
   xhr.send(JSON.stringify({ data:data }));
+  if(xhr.status===401){ throw {unauthorized:true}; }
   if(xhr.status<200 || xhr.status>=300) throw new Error('HTTP '+xhr.status);
   return true;
 }
 var RemoteAdapter = {
   name:'云端同步(MySQL)',
-  _ok:true, _busy:false, _timer:null,
+  _ok:true, _busy:false, _timer:null, _denied:false,
   load:function(){
     try{
       var snap=syncGet(CONFIG.storage.api);
       if(snap){
         var db=(snap.data)?snap.data:snap;   // 兼容 {ok:true,data:快照} 与直接快照两种返回
-        if(db && db.settings && db.records){ this._ok=true; return db; }
+        if(db && db.settings && db.records){ this._ok=true; this._denied=false; return db; }
       }
-    }catch(e){ console.warn('远端读取失败，使用本地镜像', e); }
+    }catch(e){
+      if(e && e.unauthorized){ this._denied=true; this._ok=false; return LocalAdapter.load(); }
+      console.warn('远端读取失败，使用本地镜像', e);
+    }
     this._ok=false;
     return LocalAdapter.load();
   },
   save:function(data){
     LocalAdapter.save(data);
     var self=this;
-    this._timer=setTimeout(function(){
-      if(self._busy) return;
-      self._busy=true;
-      try{ syncPost(CONFIG.storage.api, data); self._ok=true; }
-      catch(e){ self._ok=false; console.warn('远端同步失败，已留本地镜像', e); }
-      self._busy=false;
-    }, 500);
+    if(this._denied) return true;              // 没令牌就别白费力气往远端写
+    this._pending=data;                        // 永远以最新快照为准
+    if(this._timer) clearTimeout(this._timer); // 撤掉上一次的待发任务，别让它抢在前面发旧数据
+    this._timer=setTimeout(function(){ self.flush(); }, 500);
     return true;
   },
-  status:function(){ return this._ok?'cloud':'local'; },
-  statusText:function(){ return this._ok?'云端同步(MySQL)':'本地存储(同步失败)'; }
+  /* 真正把待发快照推上去。失败不丢数据：留在 _pending 里定时重试。 */
+  flush:function(){
+    var self=this;
+    if(this._busy){ this._timer=setTimeout(function(){ self.flush(); }, 800); return; }
+    if(!this._pending) return;
+    var data=this._pending;
+    this._pending=null;
+    this._busy=true;
+    try{
+      syncPost(CONFIG.storage.api, data);
+      this._ok=true; this._denied=false;
+    }catch(e){
+      this._ok=false;
+      if(e && e.unauthorized){ this._denied=true; }
+      else if(!this._pending){
+        this._pending=data;
+        this._timer=setTimeout(function(){ self.flush(); }, 3000);
+      }
+    }
+    this._busy=false;
+    renderStatus();
+  },
+  status:function(){ return this._denied?'denied':(this._ok?'cloud':'local'); },
+  statusText:function(){
+    return this._denied?'未授权（缺令牌）':(this._ok?'云端同步(MySQL)':'本地存储(同步失败)');
+  }
 };
 var Storage;
 if(CONFIG.storage.mode==='cloud'){
@@ -2029,7 +2072,7 @@ function openData(){
   +'<div class="card pad" style="margin-bottom:14px">'
   +'<div style="font-size:12px;color:var(--text-2)">当前存储</div>'
   +'<div style="font-size:15px;font-weight:600;margin-top:2px">'+esc(Storage.statusText())+'</div>'
-  +'<div class="hint">数据保存在这台设备的浏览器里，不上传任何服务器。换设备或清理浏览器前请先导出备份。</div></div>'
+  +'<div class="hint">数据保存在本机 MySQL 库 <code>'+esc('ledger')+'</code>，网页只是界面。浏览器里另有一份镜像缓存，仅在后端连不上时兜底。换设备或清理浏览器前请先导出备份。</div></div>'
   +'<div class="card pad">'
   +'<button class="mi" id="dExportJson"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><path d="M4 19h16"/></svg>'
   +'<span>导出 JSON 备份<span class="mi-s">完整快照，可导入恢复（当前 '+cnt+' 条）</span></span></button>'
@@ -2044,7 +2087,7 @@ function openData(){
   +'<div class="card pad" style="margin-top:14px"><button class="mi dg" id="dClearAll">'
   +'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M12 8v5M12 16h.01"/></svg>'
   +'<span>清空全部数据<span class="mi-s">不可恢复，请务必先导出备份</span></span></button></div>'
-  +'<div class="hint" style="margin-top:16px">后期接入云端同步后，这里会显示同步状态与手动同步按钮。存储层已按适配器模式写好，接后端不用动业务代码。</div>'
+  +'<div class="hint" style="margin-top:16px">网页与后端在同一台机器时无需配置；手机通过局域网访问需要访问令牌（见使用手册第三节）。导出的 JSON 是完整快照，可在任何设备导入恢复。</div>'
   +'</div>';
   $('sheetData').innerHTML=html;
   $('maskData').classList.add('on');
@@ -2214,6 +2257,11 @@ function bindGlobal(){
   document.addEventListener('keydown',function(e){
     if(e.key==='Escape'){
       if($('maskConfirm').classList.contains('on')){ $('maskConfirm').classList.remove('on'); return; }
+      if($('maskToken').classList.contains('on')){
+        $('maskToken').classList.remove('on'); document.body.style.overflow='';
+        if(_inited){ Storage=LocalAdapter; renderStatus(); toast('当前为本地模式，不同步'); }
+        return;
+      }
       if($('maskCat').classList.contains('on')){ closeCatEditor(); return; }
       if($('maskAcc').classList.contains('on')){ closeAccEditor(); return; }
       if($('maskEdit').classList.contains('on')){ closeEdit(); return; }
@@ -2245,8 +2293,42 @@ function bindGlobal(){
   var madd=$('mnavAdd');
   if(madd) madd.addEventListener('click',function(){ openEdit(null); });
 }
+/* ---------- 访问令牌 ----------
+   账本后端要求令牌才能读写（防的是「局域网里别人打开页面」和「你访问的网页偷读数据」）。
+   令牌在本机 ~/.ledger.conf 的 api_token= 处；用带 ?t=<令牌> 的链接打开一次就存下来了。*/
+function openTokenSheet(onDone){
+  var html='<div class="cf-b">'
+    +'<div class="cf-t">需要访问令牌</div>'
+    +'<div class="cf-d">这个账本服务只接受带令牌的请求。令牌在启动服务那台电脑的<br>'
+    +'<code>~/.ledger.conf</code> 里 <code>api_token=</code> 后面那串。<br>'
+    +'也可以直接用带 <code>?t=令牌</code> 的链接打开一次。</div>'
+    +'<div class="cf-i"><input class="inp" id="tkIn" type="password" autocomplete="off" placeholder="粘贴令牌"></div>'
+    +'<div class="cf-d" style="font-size:12px;margin-top:10px">没有令牌也可以先进「本地模式」，'
+    +'但记的账只存在这台设备，不会同步到 MySQL。</div>'
+    +'</div><div class="cf-f">'
+    +'<button id="tkSkip">本地模式</button>'
+    +'<button id="tkOk" class="ok">连接</button></div>';
+  $('tokenBox').innerHTML=html;
+  $('maskToken').classList.add('on');
+  document.body.style.overflow='hidden';
+  var inp=$('tkIn');
+  function finish(v){
+    $('maskToken').classList.remove('on');
+    document.body.style.overflow='';
+    if(v){ try{ localStorage.setItem(CONFIG.storage.tokenKey, v); }catch(e){} API_TOKEN=v; }
+    onDone(!!v);
+  }
+  $('tkOk').addEventListener('click',function(){
+    var v=(inp.value||'').trim();
+    if(!v){ toast('请粘贴令牌，或选择「本地模式」'); return; }
+    finish(v);
+  });
+  $('tkSkip').addEventListener('click',function(){ finish(''); });
+  inp.addEventListener('keydown',function(e){ if(e.key==='Enter') $('tkOk').click(); });
+  if(inp.focus) setTimeout(function(){ inp.focus(); },60);
+}
 var _inited=false;
-function init(){
+function boot(){
   if(_inited) return;
   _inited=true;
   loadDB();
@@ -2257,6 +2339,22 @@ function init(){
   refreshAll();
   var cnt=getRecords().length;
   if(cnt>0&&cnt%30===0) setTimeout(function(){ toast('数据已积累 '+cnt+' 条，建议导出备份'); },900);
+  // 服务端说令牌不对/没有 → 页面照常能用（本地模式），但要明确告诉用户为什么没同步
+  if(Storage.status && Storage.status()==='denied') askToken();
+}
+function askToken(){
+  openTokenSheet(function(){
+    if(!API_TOKEN){ Storage=LocalAdapter; renderStatus(); toast('当前为本地模式，不同步'); return; }
+    loadDB();                      // 令牌对了就把远端快照拉下来
+    state.date=todayStr();
+    refreshAll();
+    toast(Storage.status()==='denied' ? '令牌仍不对' : '已连接云端');
+  });
+}
+function init(){
+  if(_inited) return;
+  API_TOKEN = pickToken();
+  boot();
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',init);
 else init();
