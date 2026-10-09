@@ -6,11 +6,12 @@
 --   1) mysqldump -uroot -p ledger > ~/ledger-backup-$(date +%F).sql   （回车后输密码）
 --   2) 双击 backup.command
 --   3) 应用内 右上角「数据」→ 导出 JSON
--- 另外：第 11 行 USE `ledger` 是硬编码库名，导入前确认库名无误，别导错库。
+-- 目标库由命令行给出，本文件不再写死USE（否则 mysql -D 也会被它带跑，导错库）：
+--   mysql -uroot -p ledger < ledger-init.sql        （回车后输密码）
+--   mysql -uroot -p ledger_test < ledger-init.sql   （建测试库，别碰真库）
+-- 账号口令也记在 ~/.ledger.conf 里，见 server.py --init-conf
 -- ==========================================================================
 --
--- 用法: mysql -uroot -p ledger < ledger-init.sql      （回车后输密码）
--- 账号口令也记在 ~/.ledger.conf 里，见 server.py --init-conf
 -- 说明: 建表 + 建 7 个空账户（初始余额均为 0）+ 三通道分类，不含任何示例数据。
 --
 -- v2 变更：
@@ -18,8 +19,6 @@
 --   2. records.account / to_account 存账户 id；转账类记录用两端账户表达资金流动
 --   3. categories 改为三通道 32 项（expense 20 / income 9 / transfer 3 + 余额调整）
 --   4. 账户余额不落库，由 初始余额 + 收入 - 支出 - 转出 + 转入 实时派生，永不漂移
-
-USE `ledger`;
 
 SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;

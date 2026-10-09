@@ -20,6 +20,8 @@
 """
 
 import argparse
+import glob
+import gzip
 import hmac
 import json
 import os
@@ -28,6 +30,7 @@ import secrets
 import socket
 import sys
 import threading
+import time
 import traceback
 from datetime import date, datetime
 from decimal import Decimal
@@ -60,6 +63,22 @@ CONF_DEFAULTS = {
     "password": "",
     "database": "ledger",
 }
+# 配置文件里的键名<-> 内部键名。原先内部叫 database、配置里叫 db_name，
+# 两者对不上，导致 ~/.ledger.conf 里的 db_name 一直被忽略、永远连ledger 库。
+CONF_FILE_KEYS = {
+    "host": "db_host",
+    "port": "db_port",
+    "user": "db_user",
+    "password": "db_password",
+    "database": "db_name",
+}
+CONF_ENV_KEYS = {
+    "host": "LEDGER_DB_HOST",
+    "port": "LEDGER_DB_PORT",
+    "user": "LEDGER_DB_USER",
+    "password": "LEDGER_DB_PASSWORD",
+    "database": "LEDGER_DB_NAME",
+}
 
 CONF_TEMPLATE = """\
 # 个人账本后端配置（由 server.py --init-conf 生成）
@@ -69,8 +88,15 @@ db_port=%s
 db_user=%s
 db_password=
 db_name=%s
-# API 令牌：留空则首次启动自动生成并写回本文件。前端从 index.html 里自动带上。
+# API 令牌：留空则首次启动自动生成并写回本文件。手机首次访问用带 ?t=<令牌> 的链接。
 api_token=
+
+# ---- 自动备份（防止一次坏写入把账目全冲掉）----
+# 写库前先把当前状态存成 backups/auto-*.json.gz，格式与应用内导出的 JSON 一致。
+auto_backup=1                 # 0=关闭
+auto_backup_interval=300      # 两次自动备份的最小间隔（秒），记账过程中不会每次都备份
+auto_backup_keep=30           # 最多保留多少份自动备份，超出删最旧的
+# backup_dir=/Volumes/移动硬盘/ledger-backups   # 想存到外置硬盘就填这行
 """
 
 
@@ -84,7 +110,11 @@ def load_conf():
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                conf[k.strip()] = v.strip()
+                k, v = k.strip(), v.strip()
+                if k in conf and conf[k] != v:
+                    sys.stderr.write("[配置] %s 里 %s 出现两次（%s / %s），以最后一个为准\n"
+                                     % (CONF_PATH, k, conf[k], v))
+                conf[k] = v
     except FileNotFoundError:
         pass
     except OSError as e:
@@ -92,18 +122,38 @@ def load_conf():
     return conf
 
 
+# 启动时读一次配置，后面 db_* 与自动备份参数都从这里取
+FILE_CONF = load_conf()
+
+
+def conf_get(key, default=None):
+    v = FILE_CONF.get(key)
+    return default if v is None or v == "" else v
+
+
+def conf_num(key, default):
+    try:
+        return int(conf_get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def build_db_conf():
-    file_conf = load_conf()
+    """优先级：环境变量 > ~/.ledger.conf 的 db_* > 内置默认值"""
     conf = dict(CONF_DEFAULTS)
     for k in CONF_DEFAULTS:
-        val = os.environ.get("LEDGER_DB_" + k.upper())
+        val = os.environ.get(CONF_ENV_KEYS[k])
         if val is None:
-            val = file_conf.get("db_" + k)
-        if val is not None:
+            val = FILE_CONF.get(CONF_FILE_KEYS[k])
+        if val is not None and val != "":
             conf[k] = val
+    try:
+        port = int(conf["port"])
+    except (TypeError, ValueError):
+        port = 3306
     return {
         "host": conf["host"] or "127.0.0.1",
-        "port": int(conf["port"] or 3306),
+        "port": port,
         "user": conf["user"] or "root",
         "password": conf["password"],
         "database": conf["database"] or "ledger",
@@ -176,6 +226,78 @@ def check_conf_perms():
 
 
 DB_CONF = build_db_conf()
+
+# ----------------------------------------------------------------------------
+# 自动备份
+#   POST /api/db 是「先清表再全量写回」，一次坏写入（或手滑导入错文件）就足以
+#   把全部账目冲掉。所以每次写库前先把当前状态存一份 gzipped JSON，
+#   格式与应用内「导出 JSON」完全一致，出了事可以直接导入回去。
+#   记账过程中每笔都会触发写库，因此按 auto_backup_interval 节流。
+# ----------------------------------------------------------------------------
+BACKUP_DIR = os.path.expanduser(conf_get("backup_dir") or os.path.join(BASE_DIR, "backups"))
+AUTO_BACKUP = str(conf_get("auto_backup", "1")).lower() not in ("0", "false", "no")
+AUTO_BACKUP_INTERVAL = max(0, conf_num("auto_backup_interval", 300))
+AUTO_BACKUP_KEEP = max(1, conf_num("auto_backup_keep", 30))
+_auto_backup_lock = threading.Lock()
+_last_backup_ts = 0.0
+READ_ONLY = False   # main() 里按 --read-only 置True
+
+
+def auto_backup_files():
+    return sorted(glob.glob(os.path.join(BACKUP_DIR, "auto-*.json.gz")))
+
+
+def prune_auto_backups():
+    files = auto_backup_files()
+    for old in files[:-AUTO_BACKUP_KEEP] if len(files) > AUTO_BACKUP_KEEP else []:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+def newest_auto_backup_age():
+    """最新一份自动备份距今多少秒；没有则返回 None"""
+    files = auto_backup_files()
+    if not files:
+        return None
+    try:
+        return max(0.0, time.time() - os.path.getmtime(files[-1]))
+    except OSError:
+        return None
+
+
+def auto_backup(reason, force=False):
+    """写库前存一份当前快照。返回文件路径，失败返回 None（不阻断写库）"""
+    if not AUTO_BACKUP:
+        return None
+    global _last_backup_ts
+    with _auto_backup_lock:
+        now = time.time()
+        if not force and AUTO_BACKUP_INTERVAL and (now - _last_backup_ts) < AUTO_BACKUP_INTERVAL:
+            return None
+        _last_backup_ts = now
+        try:
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            payload = {
+                "app": "wb-ledger",
+                "version": 1,
+                "exportedAt": datetime.now().isoformat(timespec="seconds"),
+                "reason": reason,
+                "data": read_snapshot(),
+            }
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            name = "auto-%s.json.gz" % datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = os.path.join(BACKUP_DIR, name)
+            with gzip.open(path, "wb") as f:
+                f.write(raw)
+            prune_auto_backups()
+            print("[自动备份] %s（%s，%d 条流水）"
+                  % (name, reason, len(payload["data"].get("records") or [])))
+            return path
+        except Exception as e:
+            sys.stderr.write("[自动备份] 失败（不阻断本次写入）：%s\n" % e)
+            return None
 
 _LOCK = threading.Lock()
 
@@ -614,6 +736,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if READ_ONLY:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+            except Exception:
+                pass
+            return self._err("服务以 --read-only 启动，拒绝任何写入。", 403)
         if path.startswith("/api/") and not self._authorized():
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -629,6 +759,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/db":
                 data = payload.get("data") if isinstance(payload, dict) and "data" in payload else payload
                 with _LOCK:
+                    auto_backup("写库前")      # 先留一份现在的状态，坏写入也能退回去
                     stat = write_snapshot(data)
                 return self._json({"ok": True, "saved": stat})
             return self._err("未知接口: " + path, 404)
@@ -668,6 +799,12 @@ def lan_ip():
 
 
 def main():
+    # stdout 默认是块缓冲：重定向到文件或launchd 日志时，print 的内容会卡在缓冲区里，
+    # 服务被杀就丢了——而「手机访问链接（含令牌）」正是靠 print 输出的，必须实时可见。
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
     ap = argparse.ArgumentParser(description="个人账本本地后端")
     ap.add_argument("--host", default="127.0.0.1", help="监听地址；手机访问用 0.0.0.0")
     ap.add_argument("--port", type=int, default=8765)
@@ -678,6 +815,8 @@ def main():
     ap.add_argument("--db-pass", default=DB_CONF["password"], help="覆盖配置里的数据库口令")
     ap.add_argument("--init-conf", action="store_true",
                     help="生成 ~/.ledger.conf 配置模板（含口令，权限 600）后退出")
+    ap.add_argument("--read-only", action="store_true",
+                    help="只读模式：拒绝一切写入。排查/演示/验证时用，账本绝不会被改")
     args = ap.parse_args()
 
     if args.init_conf:
@@ -688,9 +827,13 @@ def main():
         "host": args.db_host, "port": args.db_port,
         "user": args.db_user, "password": args.db_pass, "database": args.db_name,
     })
+    global READ_ONLY
+    READ_ONLY = args.read_only
 
     check_conf_perms()
     load_or_create_token()
+    if args.read_only:
+        print("  模式：只读（拒绝一切写入，POST /api/db 会返回 403）")
     if not DB_CONF["password"]:
         sys.stderr.write(
             "没读到数据库口令。请先执行：\n"
@@ -715,6 +858,17 @@ def main():
     print("  配置来源：%s" % CONF_PATH)
     print("  流水 %d 条 · 账户 %d 个 · 分类 %d 项"
           % (len(snap["records"]), len(snap["settings"]["accounts"]), len(snap["settings"]["categories"])))
+    if AUTO_BACKUP:
+        age = newest_auto_backup_age()
+        if age is None:
+            auto_backup("服务启动（首次备份）", force=True)
+        elif age > 86400:
+            auto_backup("服务启动（距上次备份 %.1f 小时）" % (age / 3600.0), force=True)
+        else:
+            print("  自动备份：开启（每 %ds 最多一次，保留 %d 份）"
+                  % (AUTO_BACKUP_INTERVAL, AUTO_BACKUP_KEEP))
+    else:
+        print("  自动备份：已关闭（auto_backup=0）")
     print("本机访问：  http://127.0.0.1:%d/   （本机免令牌）" % args.port)
     if args.host == "0.0.0.0":
         ip = lan_ip()
