@@ -22,11 +22,8 @@
 import argparse
 import glob
 import gzip
-import hmac
 import json
 import os
-import re
-import secrets
 import socket
 import sys
 import threading
@@ -35,7 +32,7 @@ import traceback
 from datetime import date, datetime
 from decimal import Decimal
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 try:
     import pymysql
@@ -82,14 +79,12 @@ CONF_ENV_KEYS = {
 
 CONF_TEMPLATE = """\
 # 个人账本后端配置（由 server.py --init-conf 生成）
-# 本文件含数据库口令与 API 令牌，权限必须为 600： chmod 600 %s
+# 本文件含数据库口令，权限必须为 600： chmod 600 %s
 db_host=%s
 db_port=%s
 db_user=%s
 db_password=
 db_name=%s
-# API 令牌：留空则首次启动自动生成并写回本文件。手机首次访问用带 ?t=<令牌> 的链接。
-api_token=
 
 # ---- 自动备份（防止一次坏写入把账目全冲掉）----
 # 写库前先把当前状态存成 backups/auto-*.json.gz，格式与应用内导出的 JSON 一致。
@@ -176,43 +171,6 @@ def write_conf_template():
     os.chmod(CONF_PATH, 0o600)
     print(("已覆盖配置：" if existed else "已生成配置：") + CONF_PATH)
     print("请把 db_password= 填成本机 MySQL 的 root 密码（填完 chmod 600 %s），再启动服务。" % CONF_PATH)
-
-
-API_TOKEN = ""
-
-
-def load_or_create_token():
-    """读配置里的 api_token；没有就生成一个写回配置。
-
-    令牌是「谁能读写账本」的钥匙：局域网里别人猜到 8765 端口就能拿到全部账目，
-    而任何网页都能用 JS 请求 127.0.0.1:8765，所以必须校验。
-    """
-    global API_TOKEN
-    try:
-        with open(CONF_PATH, "r", encoding="utf-8") as f:
-            text = f.read()
-    except FileNotFoundError:
-        API_TOKEN = secrets.token_urlsafe(24)
-        sys.stderr.write("[安全] 没有 %s，本次用临时令牌（重启会变）：%s\n" % (CONF_PATH, API_TOKEN))
-        return API_TOKEN
-
-    m = re.search(r"(?m)^api_token=(.*)$", text)
-    if m and m.group(1).strip():
-        API_TOKEN = m.group(1).strip()
-        return API_TOKEN
-
-    API_TOKEN = secrets.token_urlsafe(24)
-    text = re.sub(r"(?m)^api_token=.*$", "api_token=" + API_TOKEN, text) if m else (
-        (text if text.endswith("\n") else text + "\n") + "api_token=%s\n" % API_TOKEN
-    )
-    try:
-        with open(CONF_PATH, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.chmod(CONF_PATH, 0o600)
-        print("已生成 API 令牌并写入 %s（前端会自动带上，不用手动填）" % CONF_PATH)
-    except OSError as e:
-        sys.stderr.write("[安全] 令牌写回配置失败（%s），本次用临时令牌，重启后会变\n" % e)
-    return API_TOKEN
 
 
 def check_conf_perms():
@@ -676,39 +634,6 @@ class Handler(BaseHTTPRequestHandler):
     def _err(self, msg, code=500):
         self._json({"ok": False, "error": str(msg)}, code)
 
-    def _unauthorized(self):
-        body = json.dumps({
-            "ok": False,
-            "error": "缺少或错误的 API 令牌。手机/别的浏览器访问请用带 ?t=<令牌> 的链接，"
-                     "或在 ~/.ledger.conf 的 api_token= 处填入正确令牌。",
-        }, ensure_ascii=False).encode("utf-8")
-        self.send_response(401)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Ledger-Token-Required", "1")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _authorized(self):
-        """本机（回环地址）免令牌，方便桌面浏览器；手机/局域网必须校验令牌。
-
-        令牌来源：请求头 X-Ledger-Token，或 URL 上的 ?t=<令牌>（方便手机加书签）。
-        对方伪造不了回环来源：TCP 三次握手必须真的从127.0.0.1 发起。
-        """
-        if not API_TOKEN:
-            return True
-        try:
-            host = self.client_address[0]
-        except Exception:
-            host = ""
-        if host in ("127.0.0.1", "::1", "localhost"):
-            return True
-        got = self.headers.get("X-Ledger-Token") or ""
-        if not got:
-            got = (parse_qs(urlparse(self.path).query).get("t") or [""])[0]
-        return hmac.compare_digest(got, API_TOKEN)
-
     def do_OPTIONS(self):
         # 不开放跨域：只回 204，不带任何 Access-Control-* 头
         self.send_response(204)
@@ -716,8 +641,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        if path.startswith("/api/") and not self._authorized():
-            return self._unauthorized()
         try:
             if path == "/api/health":
                 conn = connect()
@@ -744,14 +667,6 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             return self._err("服务以 --read-only 启动，拒绝任何写入。", 403)
-        if path.startswith("/api/") and not self._authorized():
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-                if length:
-                    self.rfile.read(length)   # 读掉请求体，避免连接错位
-            except Exception:
-                pass
-            return self._unauthorized()
         try:
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length else b"{}"
@@ -800,7 +715,7 @@ def lan_ip():
 
 def main():
     # stdout 默认是块缓冲：重定向到文件或launchd 日志时，print 的内容会卡在缓冲区里，
-    # 服务被杀就丢了——而「手机访问链接（含令牌）」正是靠 print 输出的，必须实时可见。
+    # 服务被杀就丢了，所以启动信息必须实时可见。
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except AttributeError:
@@ -831,7 +746,6 @@ def main():
     READ_ONLY = args.read_only
 
     check_conf_perms()
-    load_or_create_token()
     if args.read_only:
         print("  模式：只读（拒绝一切写入，POST /api/db 会返回 403）")
     if not DB_CONF["password"]:
@@ -869,14 +783,12 @@ def main():
                   % (AUTO_BACKUP_INTERVAL, AUTO_BACKUP_KEEP))
     else:
         print("  自动备份：已关闭（auto_backup=0）")
-    print("本机访问：  http://127.0.0.1:%d/   （本机免令牌）" % args.port)
+    print("本机访问：  http://127.0.0.1:%d/" % args.port)
     if args.host == "0.0.0.0":
-        ip = lan_ip()
-        print("手机访问：  http://%s:%d/?t=%s" % (ip, args.port, API_TOKEN))
-        print("            ↑ 带 ?t= 的链接打开一次，令牌会存进该设备，之后直接用 http://%s:%d/ 即可" % (ip, args.port))
-        print("            令牌也在 %s 的 api_token= 处。别人能连到这台机器、但没令牌就读不到账本。" % CONF_PATH)
+        print("手机访问：  http://%s:%d/   （同一 WiFi 下）" % (lan_ip(), args.port))
+        print("            只在自己的家里这么做：公共 WiFi 下能连到这台机器就能读写账本")
     else:
-        print("            只监听本机。手机/局域网访问需改用 --host 0.0.0.0（届时手机要带令牌）")
+        print("            只监听本机。手机/局域网访问需改用 --host 0.0.0.0")
     print("Ctrl+C 停止")
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
